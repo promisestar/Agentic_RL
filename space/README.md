@@ -51,8 +51,19 @@ An interactive Reinforcement Learning environment for training and evaluating e-
 
 ## Running Locally
 
+推荐在仓库根目录用 uv（会安装项目本体 + `space` extra）：
+
 ```bash
-cd ecom-rlve/space
+# 在仓库根目录
+uv sync --extra space
+export HF_TOKEN="hf_..."   # Windows PowerShell: $env:HF_TOKEN="hf_..."
+uv run --extra space python space/app.py
+```
+
+Hugging Face Spaces 等场景仍可使用本目录的 `requirements.txt`：
+
+```bash
+cd space
 pip install -r requirements.txt
 export HF_TOKEN="hf_..."
 python app.py
