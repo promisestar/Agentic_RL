@@ -1,15 +1,16 @@
-"""Ollama-based LLM backend for EcomRLVE-GYM user simulation.
+"""LLM backend for EcomRLVE-GYM user simulation.
 
-Provides a thin wrapper around the Ollama HTTP API for generating
-naturalistic user utterances, strategic constraint omission, and
-mid-conversation dialogue responses.
+Provides a thin HTTP client for generating naturalistic user utterances,
+strategic constraint omission, and mid-conversation dialogue responses.
 
-Model: qwen3.5 (via local Ollama server)
-Endpoint: http://localhost:11434/api/generate
+Supported backends (selected via ``ECOM_RLVE_LLM_BACKEND``):
+    - ``ollama`` (default): local Ollama ``/api/chat``
+    - ``openai``: OpenAI-compatible chat API (vLLM, etc.) at
+      ``{base}/chat/completions``
 
 Design principles:
-    - Deterministic seeding via Ollama's seed parameter
-    - Graceful fallback to template-based generation if Ollama is unavailable
+    - Deterministic seeding when the backend supports it
+    - Graceful fallback to template-based generation if the LLM is unavailable
     - Short, focused prompts to minimise latency
     - All LLM outputs are for user-facing text only; verifier logic is unaffected
 """
@@ -18,6 +19,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 from typing import Any
 
@@ -26,51 +28,60 @@ import requests
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Configuration
+# Configuration (env overrides)
 # ---------------------------------------------------------------------------
 
-OLLAMA_BASE_URL: str = "http://localhost:11434"
-OLLAMA_MODEL: str = "qwen3.5"
-OLLAMA_TIMEOUT: int = 30  # seconds per request
-OLLAMA_TEMPERATURE: float = 0.7
-OLLAMA_MAX_TOKENS: int = 200
+_DEFAULT_OLLAMA_URL = "http://localhost:11434"
+_DEFAULT_OPENAI_URL = "http://localhost:8000/v1"
+
+LLM_BACKEND: str = os.environ.get("ECOM_RLVE_LLM_BACKEND", "ollama").strip().lower()
+LLM_MODEL: str = os.environ.get("ECOM_RLVE_LLM_MODEL", "qwen3.5")
+LLM_TIMEOUT: int = int(os.environ.get("ECOM_RLVE_LLM_TIMEOUT", "30"))
+LLM_API_KEY: str = os.environ.get("ECOM_RLVE_LLM_API_KEY", "EMPTY")
+LLM_TEMPERATURE: float = 0.7
+LLM_MAX_TOKENS: int = 500
+
+_env_base = os.environ.get("ECOM_RLVE_LLM_BASE_URL", "").strip()
+if _env_base:
+    LLM_BASE_URL: str = _env_base.rstrip("/")
+elif LLM_BACKEND == "openai":
+    LLM_BASE_URL = _DEFAULT_OPENAI_URL
+else:
+    LLM_BASE_URL = _DEFAULT_OLLAMA_URL
+
+# Backward-compatible aliases used by older call sites / docs
+OLLAMA_BASE_URL: str = LLM_BASE_URL if LLM_BACKEND == "ollama" else _DEFAULT_OLLAMA_URL
+OLLAMA_MODEL: str = LLM_MODEL
+OLLAMA_TIMEOUT: int = LLM_TIMEOUT
+OLLAMA_TEMPERATURE: float = LLM_TEMPERATURE
+OLLAMA_MAX_TOKENS: int = LLM_MAX_TOKENS
+
+
+def _strip_think_blocks(text: str) -> str:
+    """Remove residual <think>...</think> blocks from model output."""
+    return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
 
 
 # ---------------------------------------------------------------------------
-# Low-level Ollama client
+# Low-level LLM clients
 # ---------------------------------------------------------------------------
 
 
-def _ollama_generate(
+def _generate_ollama(
     prompt: str,
     seed: int = 42,
-    temperature: float = OLLAMA_TEMPERATURE,
-    max_tokens: int = OLLAMA_MAX_TOKENS,
+    temperature: float = LLM_TEMPERATURE,
+    max_tokens: int = LLM_MAX_TOKENS,
     system_prompt: str | None = None,
 ) -> str | None:
-    """Call Ollama's /api/chat endpoint with thinking disabled.
-
-    Uses the chat completions API with ``think: false`` so that
-    thinking-enabled models (like qwen3.5) produce content directly
-    without exhausting the token budget on internal reasoning.
-
-    Args:
-        prompt:        The user message string.
-        seed:          Deterministic seed for reproducibility.
-        temperature:   Sampling temperature.
-        max_tokens:    Maximum tokens to generate.
-        system_prompt: Optional system prompt to set persona/env context.
-
-    Returns:
-        Generated text string, or None if the call fails.
-    """
+    """Call Ollama's /api/chat endpoint with thinking disabled."""
     messages: list[dict[str, str]] = []
     if system_prompt:
         messages.append({"role": "system", "content": system_prompt})
     messages.append({"role": "user", "content": prompt})
 
     payload = {
-        "model": OLLAMA_MODEL,
+        "model": LLM_MODEL,
         "messages": messages,
         "stream": False,
         "think": False,  # Disable extended thinking for qwen3.5
@@ -82,30 +93,153 @@ def _ollama_generate(
     }
     try:
         resp = requests.post(
-            f"{OLLAMA_BASE_URL}/api/chat",
+            f"{LLM_BASE_URL}/api/chat",
             json=payload,
-            timeout=OLLAMA_TIMEOUT,
+            timeout=LLM_TIMEOUT,
         )
         resp.raise_for_status()
         data = resp.json()
         text = data.get("message", {}).get("content", "").strip()
-        # Safety net: strip any residual <think>...</think> blocks
-        text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+        text = _strip_think_blocks(text)
         return text if text else None
-    except (requests.RequestException, json.JSONDecodeError, KeyError) as exc:
+    except (requests.RequestException, json.JSONDecodeError, KeyError, TypeError) as exc:
         logger.warning("Ollama call failed: %s", exc)
         return None
 
 
-def is_ollama_available() -> bool:
+def _generate_openai_compatible(
+    prompt: str,
+    seed: int = 42,
+    temperature: float = LLM_TEMPERATURE,
+    max_tokens: int = LLM_MAX_TOKENS,
+    system_prompt: str | None = None,
+) -> str | None:
+    """Call an OpenAI-compatible chat completions API (e.g. vLLM)."""
+    messages: list[dict[str, str]] = []
+    if system_prompt:
+        messages.append({"role": "system", "content": system_prompt})
+    messages.append({"role": "user", "content": prompt})
+
+    # Accept base URL with or without trailing /v1
+    base = LLM_BASE_URL.rstrip("/")
+    if not base.endswith("/v1"):
+        url = f"{base}/v1/chat/completions"
+    else:
+        url = f"{base}/chat/completions"
+
+    payload: dict[str, Any] = {
+        "model": LLM_MODEL,
+        "messages": messages,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+        "seed": seed,
+        "stream": False,
+    }
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {LLM_API_KEY}",
+    }
+    try:
+        resp = requests.post(url, json=payload, headers=headers, timeout=LLM_TIMEOUT)
+        resp.raise_for_status()
+        data = resp.json()
+        choices = data.get("choices") or []
+        if not choices:
+            logger.warning("OpenAI-compatible call returned no choices")
+            return None
+        message = choices[0].get("message") or {}
+        text = (message.get("content") or "").strip()
+        text = _strip_think_blocks(text)
+        return text if text else None
+    except (requests.RequestException, json.JSONDecodeError, KeyError, TypeError, IndexError) as exc:
+        logger.warning("OpenAI-compatible LLM call failed: %s", exc)
+        return None
+
+
+def _llm_generate(
+    prompt: str,
+    seed: int = 42,
+    temperature: float = LLM_TEMPERATURE,
+    max_tokens: int = LLM_MAX_TOKENS,
+    system_prompt: str | None = None,
+) -> str | None:
+    """Dispatch user-sim generation to the configured LLM backend.
+
+    Args:
+        prompt:        The user message string.
+        seed:          Deterministic seed for reproducibility (best-effort).
+        temperature:   Sampling temperature.
+        max_tokens:    Maximum tokens to generate.
+        system_prompt: Optional system prompt to set persona/env context.
+
+    Returns:
+        Generated text string, or None if the call fails.
+    """
+    if LLM_BACKEND == "openai":
+        return _generate_openai_compatible(
+            prompt,
+            seed=seed,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            system_prompt=system_prompt,
+        )
+    if LLM_BACKEND != "ollama":
+        logger.warning(
+            "Unknown ECOM_RLVE_LLM_BACKEND=%r; falling back to ollama",
+            LLM_BACKEND,
+        )
+    return _generate_ollama(
+        prompt,
+        seed=seed,
+        temperature=temperature,
+        max_tokens=max_tokens,
+        system_prompt=system_prompt,
+    )
+
+
+# Backward-compatible name used throughout this module historically
+_ollama_generate = _llm_generate
+
+
+def _is_ollama_available() -> bool:
     """Check if the Ollama server is reachable and the model is loaded."""
     try:
-        resp = requests.get(f"{OLLAMA_BASE_URL}/api/tags", timeout=5)
+        resp = requests.get(f"{LLM_BASE_URL}/api/tags", timeout=5)
         resp.raise_for_status()
         models = resp.json().get("models", [])
-        return any(OLLAMA_MODEL in m.get("name", "") for m in models)
-    except (requests.RequestException, json.JSONDecodeError):
+        return any(LLM_MODEL in m.get("name", "") for m in models)
+    except (requests.RequestException, json.JSONDecodeError, TypeError):
         return False
+
+
+def _is_openai_available() -> bool:
+    """Check if an OpenAI-compatible server responds at /models."""
+    base = LLM_BASE_URL.rstrip("/")
+    if not base.endswith("/v1"):
+        url = f"{base}/v1/models"
+    else:
+        url = f"{base}/models"
+    headers = {"Authorization": f"Bearer {LLM_API_KEY}"}
+    try:
+        resp = requests.get(url, headers=headers, timeout=5)
+        resp.raise_for_status()
+        # Reachable /models is enough; served model id may differ from env name.
+        _ = resp.json()
+        return True
+    except (requests.RequestException, json.JSONDecodeError, TypeError):
+        return False
+
+
+def is_llm_available() -> bool:
+    """Check if the configured user-sim LLM backend is reachable."""
+    if LLM_BACKEND == "openai":
+        return _is_openai_available()
+    return _is_ollama_available()
+
+
+def is_ollama_available() -> bool:
+    """Backward-compatible alias for :func:`is_llm_available`."""
+    return is_llm_available()
 
 
 # ---------------------------------------------------------------------------
@@ -235,7 +369,7 @@ def verbalize_return_request(
         "Write ONLY the customer message:"
     )
 
-    text = _ollama_generate(prompt, seed=seed, max_tokens=150)
+    text = _llm_generate(prompt, seed=seed, max_tokens=150)
     if text is None:
         return None, set(), set()
 
@@ -482,7 +616,7 @@ def verbalize_cart_request(
         "Customer message:"
     )
 
-    text = _ollama_generate(prompt, seed=seed, temperature=1.0, max_tokens=200)
+    text = _llm_generate(prompt, seed=seed, temperature=1.0, max_tokens=200)
     if text is None:
         return None, set(), set()
 
@@ -541,7 +675,7 @@ def detect_clarification_with_llm(
 ) -> str | None:
     """Use the LLM to detect if the assistant is asking about a pending slot.
 
-    Falls back gracefully if Ollama is unavailable. This is more robust
+    Falls back gracefully if the configured LLM backend is unavailable. This is more robust
     than pure keyword matching because it understands paraphrases like
     "do you want one or two?" -> quantity_details.
 
@@ -589,7 +723,7 @@ def detect_clarification_with_llm(
         f"or 'none' if the assistant is not asking about any of them."
     )
 
-    result = _ollama_generate(
+    result = _llm_generate(
         prompt, seed=seed, max_tokens=20, system_prompt=system_prompt,
     )
     if result is None:
@@ -676,7 +810,7 @@ def verbalize_constraints(
         "Customer message:"
     )
 
-    return _ollama_generate(prompt, seed=seed, max_tokens=150)
+    return _llm_generate(prompt, seed=seed, max_tokens=150)
 
 
 # ---------------------------------------------------------------------------
@@ -717,7 +851,7 @@ def verbalize_with_strategic_omission(
         "Write ONLY the customer message (1-3 sentences, casual tone):"
     )
 
-    text = _ollama_generate(prompt, seed=seed, max_tokens=150)
+    text = _llm_generate(prompt, seed=seed, max_tokens=150)
     if text is None:
         return None, set(), set()
 
@@ -830,7 +964,7 @@ def generate_dialogue_response(
     prompt += f"Your mood: {mood}\n"
     prompt += "\nRespond in 1-2 sentences. Be brief and realistic.\nCustomer response:"
 
-    return _ollama_generate(
+    return _llm_generate(
         prompt, seed=seed, max_tokens=100, system_prompt=system_prompt,
     )
 
@@ -871,7 +1005,7 @@ def generate_clarification_response(
         "Customer response:"
     )
 
-    return _ollama_generate(
+    return _llm_generate(
         prompt, seed=seed, max_tokens=60, system_prompt=system_prompt,
     )
 
@@ -934,7 +1068,7 @@ def generate_variant_attrs_for_category(
         "Now generate for the category above:"
     )
 
-    text = _ollama_generate(prompt, seed=seed, temperature=0.7, max_tokens=400)
+    text = _llm_generate(prompt, seed=seed, temperature=0.7, max_tokens=400)
     if text is None:
         _LLM_VARIANT_CACHE[subcategory] = {}
         return {}

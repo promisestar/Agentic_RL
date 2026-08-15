@@ -18,3 +18,4 @@ outputs/
 results/
 .env
 space/.env
+scripts/sync_project_to_remote.ps1

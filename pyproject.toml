@@ -26,6 +26,17 @@ space = [
     "gradio>=5.0.0",
     "huggingface_hub>=0.26.0",
 ]
+# OpenEnv GRPO training (scripts/train_openenv.py)
+# Install: uv sync --extra train
+#
+# Qwen3.5 needs transformers>=5.2. Current unsloth caps transformers at <=5.5.0,
+# while vllm>=0.24 requires transformers>=5.5.3 — no overlapping range.
+# Therefore train does NOT hard-depend on vllm; use --fast_inference only if you
+# install a compatible vllm stack separately (typically for older model families).
+train = [
+    "unsloth",
+    "transformers>=5.2.0,<=5.5.0",
+]
 
 [dependency-groups]
 dev = [
@@ -43,6 +54,13 @@ packages = ["src/ecom_rlve"]
 
 [tool.uv]
 package = true
+# Prefer CUDA wheels that match the local toolkit when resolving torch stack.
+torch-backend = "auto"
+
+[[tool.uv.index]]
+name = "tsinghua"
+url = "https://pypi.tuna.tsinghua.edu.cn/simple"
+default = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

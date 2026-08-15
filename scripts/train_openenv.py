@@ -20,7 +20,8 @@ Usage:
         --load_in_4bit \
         --output_dir outputs/ecomrlve_grpo
 
-Requires: pip install unsloth trl transformers datasets torch
+Requires (via uv; default index is Tsinghua):
+    uv sync --extra train
 """
 
 from __future__ import annotations
@@ -55,6 +56,29 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 logger = logging.getLogger("ecomrlve.train_openenv")
+
+
+def _setup_log_file(log_path: Path) -> None:
+    """Attach a FileHandler to the root logger so INFO+ goes to disk too.
+
+    Stream handlers (console) are kept; we only add a file sink. Idempotent:
+    if a previous handler for this path exists, leave it alone.
+    """
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    file_handler = logging.FileHandler(log_path, encoding="utf-8")
+    file_handler.setLevel(logging.INFO)
+    file_handler.setFormatter(
+        logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+    )
+    root = logging.getLogger()
+    # Avoid stacking handlers across re-runs in the same process.
+    for existing in root.handlers:
+        if (
+            isinstance(existing, logging.FileHandler)
+            and Path(getattr(existing, "baseFilename", "")) == log_path
+        ):
+            return
+    root.addHandler(file_handler)
 
 
 # ===================================================================
@@ -383,6 +407,65 @@ def env_reward(completions: list[list[dict[str, str]]], **kwargs: Any) -> list[f
 
 
 # ===================================================================
+# Tokenizer / Processor compatibility
+# ===================================================================
+
+def resolve_text_tokenizer(processing_or_tokenizer: Any) -> Any:
+    """Return an object with text tokenizer APIs (encode / chat template).
+
+    Unsloth may return a multimodal Processor for some checkpoints
+    (e.g. Qwen3.5 → ``Qwen3VLProcessor``). Those expose ``.tokenizer``
+    but not top-level ``.encode()``. Prefer the inner tokenizer when
+    present so the rest of this script can assume a text tokenizer.
+    """
+    inner = getattr(processing_or_tokenizer, "tokenizer", None)
+    if inner is not None and callable(getattr(inner, "encode", None)):
+        logger.info(
+            "Resolved text tokenizer from %s → %s",
+            type(processing_or_tokenizer).__name__,
+            type(inner).__name__,
+        )
+        return inner
+    return processing_or_tokenizer
+
+
+def apply_chat_template_text(
+    tokenizer: Any,
+    messages: list[dict[str, str]],
+    *,
+    add_generation_prompt: bool = True,
+) -> str:
+    """Render chat messages to a plain string via chat template."""
+    return tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=add_generation_prompt,
+    )
+
+
+def count_tokens(tokenizer: Any, text: str) -> int:
+    """Count tokens for a string across tokenizer / processor variants."""
+    encode = getattr(tokenizer, "encode", None)
+    if callable(encode):
+        return len(encode(text))
+
+    # Fallback: some processors only tokenize via __call__
+    encoded = tokenizer(text)
+    input_ids = encoded.get("input_ids") if isinstance(encoded, dict) else None
+    if input_ids is None and hasattr(encoded, "input_ids"):
+        input_ids = encoded.input_ids
+    if input_ids is None:
+        raise TypeError(
+            f"Cannot count tokens with {type(tokenizer).__name__}: "
+            "no encode() and no input_ids from __call__"
+        )
+    # input_ids may be nested for batched processor output
+    if input_ids and isinstance(input_ids[0], (list, tuple)):
+        return len(input_ids[0])
+    return len(input_ids)
+
+
+# ===================================================================
 # Dataset builder
 # ===================================================================
 
@@ -452,6 +535,14 @@ def parse_args() -> argparse.Namespace:
         "--lora_rank", type=int, default=16,
         help="LoRA rank (default: 16)",
     )
+    parser.add_argument(
+        "--fast_inference", action="store_true", default=False,
+        help=(
+            "Enable Unsloth/vLLM fast inference for GRPO generation. "
+            "Requires a separately installed vLLM compatible with the "
+            "current transformers pin; default False (needed for Qwen3.5)."
+        ),
+    )
 
     # Environment
     parser.add_argument(
@@ -516,12 +607,35 @@ def parse_args() -> argparse.Namespace:
         choices=["none", "wandb", "tensorboard", "trackio"],
         help="Experiment tracker (default: none)",
     )
+    parser.add_argument(
+        "--log_to_file", action="store_true", default=False,
+        help=(
+            "Also tee training logs to a file. Default path is "
+            "<output_dir>/train.log (created if missing)."
+        ),
+    )
+    parser.add_argument(
+        "--log_path", type=str, default=None,
+        help=(
+            "Explicit log file path. Overrides the default "
+            "<output_dir>/train.log. Implies --log_to_file."
+        ),
+    )
 
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+
+    if args.log_path:
+        log_file = Path(args.log_path).expanduser().resolve()
+        _setup_log_file(log_file)
+        logger.info("Logging to file: %s", log_file)
+    elif args.log_to_file:
+        log_file = Path(args.output_dir) / "train.log"
+        _setup_log_file(log_file)
+        logger.info("Logging to file: %s", log_file)
 
     logger.info("=" * 70)
     logger.info("EcomRLVE-GYM OpenEnv Training")
@@ -555,14 +669,24 @@ def main() -> None:
 
     load_in_4bit = args.load_in_4bit and not args.load_in_16bit
 
-    model, tokenizer = FastLanguageModel.from_pretrained(
+    if args.fast_inference:
+        logger.info("fast_inference=True (requires a compatible vLLM install)")
+    else:
+        logger.info(
+            "fast_inference=False (default). Pass --fast_inference only if "
+            "vLLM is installed and compatible with transformers<=5.5.0."
+        )
+
+    model, processing = FastLanguageModel.from_pretrained(
         model_name=args.model,
         max_seq_length=args.max_seq_length,
         load_in_4bit=load_in_4bit,
-        fast_inference=True,       # Enable vLLM fast inference for GRPO
+        fast_inference=args.fast_inference,
         max_lora_rank=args.lora_rank,
         gpu_memory_utilization=0.6,  # Reduce if OOM
     )
+    # Qwen3.5 etc. may return a VL Processor; unwrap to a text tokenizer.
+    tokenizer = resolve_text_tokenizer(processing)
 
     logger.info("Model loaded. Adding LoRA adapters (rank=%d)...", args.lora_rank)
 
@@ -586,12 +710,12 @@ def main() -> None:
 
     # Compute max_prompt_length from a sample if not specified
     if args.max_prompt_length is None:
-        sample_text = tokenizer.apply_chat_template(
+        sample_text = apply_chat_template_text(
+            tokenizer,
             dataset[0]["prompt"],
-            tokenize=False,
             add_generation_prompt=True,
         )
-        sample_len = len(tokenizer.encode(sample_text))
+        sample_len = count_tokens(tokenizer, sample_text)
         # Add 20% headroom
         args.max_prompt_length = int(sample_len * 1.2) + 1
         logger.info(
@@ -700,16 +824,21 @@ def main() -> None:
     final_dir = os.path.join(args.output_dir, "final")
     logger.info("Saving final LoRA adapters to %s ...", final_dir)
     model.save_pretrained(final_dir)
-    tokenizer.save_pretrained(final_dir)
+    # Prefer saving the original Processor when Unsloth returned one;
+    # otherwise save the text tokenizer.
+    if processing is not tokenizer and hasattr(processing, "save_pretrained"):
+        processing.save_pretrained(final_dir)
+    else:
+        tokenizer.save_pretrained(final_dir)
 
     # ------------------------------------------------------------------
     # 8. Quick inference test
     # ------------------------------------------------------------------
     logger.info("Running quick inference test...")
     test_messages, _, _ = _OPENENV.sample_prompt(tokenizer)
-    text = tokenizer.apply_chat_template(
+    text = apply_chat_template_text(
+        tokenizer,
         test_messages,
-        tokenize=False,
         add_generation_prompt=True,
     )
 
