@@ -256,7 +256,7 @@ class EcomRLVEEnv:
 
         # Build embedding engine
         # Config keys: embedding_model (str), embedding_debug (bool)
-        emb_model = self.config.get("embedding_model", "thenlper/gte-small")
+        emb_model = self.config.get("embedding_model", "sentence-transformers/all-MiniLM-L6-v2")
         emb_debug = self.config.get("embedding_debug", catalog is None)  # auto: debug for synthetic, real for real catalog
         emb_device = self.config.get("embedding_device", None)
         self._embedding_engine = EmbeddingEngine(

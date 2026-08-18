@@ -295,6 +295,13 @@ class ProductCard(BaseModel):
 
     product_id: str = Field(..., description="Product identifier")
     title: str = Field(..., description="Product title")
+    cat: str = Field(
+        ...,
+        description=(
+            "Full category path string (e.g. 'electronics/mobile/tablets'). "
+            "Use this to verify category constraints after search."
+        ),
+    )
     price: float = Field(..., description="Price in USD")
     rating: float = Field(..., description="Rating in [1, 5]")
     ship_days: int = Field(..., description="Estimated shipping days")
@@ -348,6 +355,8 @@ def product_to_card(product: Product) -> ProductCard:
     Extracts the most relevant attributes (brand, color, size, material,
     connector_type, store, features preview) into key_attrs so the LLM has
     enough info to decide whether to fetch the full product details.
+    Always includes ``cat`` (full category path) so agents can verify
+    category constraints without an extra get_product call.
     """
     # Keys to surface in the card (high-signal attributes)
     card_attr_keys = {"brand", "color", "size", "material", "connector_type"}
@@ -370,6 +379,7 @@ def product_to_card(product: Product) -> ProductCard:
     return ProductCard(
         product_id=product.id,
         title=product.title,
+        cat=product.cat,
         price=product.price,
         rating=product.rating,
         ship_days=product.ship_days,

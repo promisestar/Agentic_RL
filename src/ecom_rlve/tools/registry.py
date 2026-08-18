@@ -288,6 +288,36 @@ class ToolRegistry:
 
         return tools
 
+    def to_openai_tools(self) -> list[dict[str, Any]]:
+        """Export tools in OpenAI / HuggingFace chat-template format.
+
+        Each entry is::
+
+            {
+                "type": "function",
+                "function": {
+                    "name": "<tool.name>",
+                    "description": "<docstring>",
+                    "parameters": <JSON Schema from pydantic>,
+                },
+            }
+
+        Pass the result as ``tools=`` to ``tokenizer.apply_chat_template``
+        so models like Qwen3.5 render a ``<tools>...</tools>`` block with
+        full parameter constraints.
+        """
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": t["name"],
+                    "description": (t["description"] or "").strip(),
+                    "parameters": t["parameters"],
+                },
+            }
+            for t in self.list_tools()
+        ]
+
     def get_tool_names(self) -> list[str]:
         """Return sorted list of all registered tool names."""
         return sorted(self._handlers.keys())

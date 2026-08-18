@@ -20,6 +20,10 @@ Usage:
         --load_in_4bit \
         --output_dir outputs/ecomrlve_grpo
 
+    Each run writes under a timestamped subdirectory of --output_dir, e.g.
+    outputs/ecomrlve_grpo/20260818_093012/{train.log,prompts.jsonl,final,...}.
+    Pass --no_timestamp to use --output_dir as-is.
+
 Requires (via uv; default index is Tsinghua):
     uv sync --extra train
 """
@@ -32,6 +36,7 @@ import logging
 import os
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -58,6 +63,26 @@ logging.basicConfig(
 logger = logging.getLogger("ecomrlve.train_openenv")
 
 
+def _resolve_run_output_dir(base_dir: str, *, with_timestamp: bool) -> Path:
+    """Resolve the per-run output directory and create it on disk.
+
+    By default each training run gets its own subdirectory under ``base_dir``
+    named ``YYYYMMDD_HHMMSS`` (local time), so ``train.log``, ``prompts.jsonl``,
+    checkpoints and ``final/`` from different runs do not overwrite each other.
+
+    When ``with_timestamp`` is False, ``base_dir`` itself is used (useful for
+    resuming into a known path or for tests that expect a fixed location).
+    """
+    base = Path(base_dir).expanduser()
+    if with_timestamp:
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        run_dir = base / stamp
+    else:
+        run_dir = base
+    run_dir.mkdir(parents=True, exist_ok=True)
+    return run_dir.resolve()
+
+
 def _setup_log_file(log_path: Path) -> None:
     """Attach a FileHandler to the root logger so INFO+ goes to disk too.
 
@@ -82,36 +107,37 @@ def _setup_log_file(log_path: Path) -> None:
 
 
 # ===================================================================
-# System prompt (what the model is told about its role & tools)
+# System prompt (role + general workflow + terminal JSON protocol)
+# Tool schemas are injected separately via apply_chat_template(tools=...).
 # ===================================================================
 
 SYSTEM_PROMPT = """\
 You are a helpful e-commerce shopping assistant. Your goal is to help \
-customers find products, manage orders, handle returns, and answer \
-policy questions.
+customers find products, manage carts and orders, handle returns, and \
+answer store-policy questions.
 
-You can use the following tools:
-- catalog.search(query, filters, top_k): Search the product catalog
-- catalog.rerank(query, candidate_product_ids, top_k): Re-rank products
-- catalog.get_product(product_id): Get full product details
-- catalog.get_variants(product_id): Get product variants
-- cart.add(product_id, variant_id, qty): Add item to cart
-- cart.remove(line_id): Remove item from cart
-- cart.view(): View current cart
-- order.list(days): List recent orders
-- order.get_status(order_id): Get order status
-- order.checkout(shipping_address_id, payment_method_id): Checkout
-- return.initiate(order_id, line_id, reason): Initiate a return
-- policy.search(query, top_k): Search policy knowledge base
+Workflow (applies to every task and every tool):
+1. Understand the user's goal and constraints.
+2. Call tools from the available tool list when you need information or \
+to change state. Arguments MUST strictly match each tool's JSON schema \
+(types, required fields, and allowed parameter names). Do not invent \
+parameter names.
+3. Read tool results (including errors). Call additional tools if you \
+still lack evidence.
+4. Only when the evidence is sufficient, submit a final answer. Do not \
+set done early.
 
-Respond with valid JSON containing:
+When you are ready to finish (no further tool calls), reply with ONLY \
+this JSON object — no <tool_call> blocks:
+
 {
     "assistant_message": "your message to the user",
-    "tool_calls": [{"name": "tool_name", "args": {...}}],
-    "answer": {"env": "PD", "recommended_product_ids": [...], "done": true}
+    "tool_calls": [],
+    "answer": {"env": "<ENV_ID>", "recommended_product_ids": [], "done": true}
 }
 
-When you have found the answer, set "done": true in the answer field.\
+Set "done": true in the answer field. Include other answer fields \
+required by the current environment when applicable.\
 """
 
 
@@ -130,13 +156,74 @@ class EcomRLVEOpenEnv:
     """
 
     def __init__(self, collection: str = "C1", seed: int = 42) -> None:
-        self.env = EcomRLVEEnv(collection=collection, seed=seed)
+        self.env = EcomRLVEEnv(collection=collection, seed=seed, config={"embedding_debug": False, "embedding_model": "/data_160TB/2024/hanshuaiteng/.cache/huggingface/hub/models--sentence-transformers--all-MiniLM-L6-v2/snapshots/1110a243fdf4706b3f48f1d95db1a4f5529b4d41/",})
         self.env.dump_dir = ""       # Disable disk trace during training
         self.env.trace_episodes = False
         self.env.validate_rewards = True
         self.collection = collection
         self.env_ids = get_collection(collection)
         self._episode_counter = 0
+        # Optional prompt/result sink for offline debugging. When set,
+        # every sampled prompt and the matching reward result are
+        # appended to the given path as JSONL. See ``_dump_records``.
+        self.dump_path: Path | None = None
+
+    # ------------------------------------------------------------------
+    # Dump helpers (used only when --dump_prompts is set)
+    # ------------------------------------------------------------------
+    def _serialize_problem_params(self, params: Any) -> dict[str, Any]:
+        """Best-effort JSON-safe copy of ProblemParams (or any mapping)."""
+        if params is None:
+            return {}
+
+        # ``hasattr(params, "__dict__")`` is True for *any* object
+        # including dicts, so handle plain mappings explicitly first.
+        if isinstance(params, dict):
+            out: dict[str, Any] = {}
+            for key, value in params.items():
+                if key.startswith("_"):
+                    continue
+                try:
+                    json.dumps(value)
+                    out[key] = value
+                except (TypeError, ValueError):
+                    out[key] = str(value)
+            return out
+
+        if hasattr(params, "__dict__"):
+            out = {}
+            for key, value in vars(params).items():
+                if key.startswith("_"):
+                    continue
+                try:
+                    json.dumps(value)
+                    out[key] = value
+                except (TypeError, ValueError):
+                    out[key] = str(value)
+            return out
+
+        return {"raw": str(params)}
+
+    def _dump_records(self, records: list[dict[str, Any]]) -> None:
+        """Append ``records`` to ``self.dump_path`` as JSONL.
+
+        We use a single-process trainer (single GPU / DataLoader worker=0)
+        so a plain ``open(..., 'a')`` is safe — no extra locking needed.
+        """
+        if self.dump_path is None or not records:
+            return
+        try:
+            self.dump_path.parent.mkdir(parents=True, exist_ok=True)
+            with self.dump_path.open("a", encoding="utf-8") as fh:
+                for rec in records:
+                    fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        except OSError as exc:
+            # The dump is purely diagnostic — never fail training because
+            # of a logging issue.
+            logger.warning("[EcomRLVEOpenEnv] dump failed: %s", exc)
+
+    # Public alias (handy for REPL / unit tests).
+    dump_records = _dump_records
 
     def sample_prompt(self, tokenizer: Any) -> tuple[list[dict[str, str]], str, int]:
         """Reset the env and produce a chat-messages prompt.
@@ -165,6 +252,32 @@ class EcomRLVEOpenEnv:
         ]
         for msg in obs.conversation:
             messages.append({"role": msg["role"], "content": msg["content"]})
+
+        # Optional debug dump: persist user message + hidden_goal so we
+        # can sanity-check what the environment produced for each
+        # training sample. See ``--dump_prompts``.
+        if self.dump_path is not None:
+            state = getattr(self.env, "_state", None)
+            hidden_goal = getattr(state, "hidden_goal", None)
+            n_tools = 0
+            try:
+                n_tools = len(self.env._tool_registry.get_tool_names())
+            except Exception:
+                n_tools = 0
+            self._dump_records([{
+                "kind": "prompt",
+                "global_step": self._episode_counter,
+                "env_id": env_id,
+                "episode_seed": episode_seed,
+                "messages": messages,
+                "user_messages": [
+                    m["content"] for m in obs.conversation
+                    if m.get("role") == "user"
+                ],
+                "hidden_goal": self._serialize_problem_params(hidden_goal),
+                "tools_injected": True,
+                "n_tools": n_tools,
+            }])
 
         return messages, env_id, episode_seed
 
@@ -238,9 +351,17 @@ def _extract_json_from_completion(text: str) -> str | None:
 
     Handles cases where the model wraps JSON in markdown code blocks
     or emits thinking tokens before the JSON.
+
+    Returns None when the text looks like a Qwen XML tool_call (those
+    should be parsed via ``parse_action`` on the raw string instead).
     """
     # Try direct JSON parse first
     text = text.strip()
+
+    # Qwen native tool calls are not JSON — callers should pass raw text
+    # to parse_action instead of using this helper.
+    if "<tool_call>" in text.lower():
+        return None
 
     # Strip markdown code fences if present
     if "```" in text:
@@ -267,30 +388,38 @@ def _extract_json_from_completion(text: str) -> str | None:
         return None
 
 
+def _completion_for_env(response: str) -> str | None:
+    """Normalize a model completion for ``env.step`` / ``parse_action``.
+
+    Prefers the raw string when it contains Qwen ``<tool_call>`` XML
+    (so the dual-format parser can see it). Otherwise extracts a JSON
+    object for the legacy / terminal-answer path.
+    """
+    if "<tool_call>" in (response or "").lower():
+        return response
+    return _extract_json_from_completion(response)
+
+
 def format_reward(completions: list[list[dict[str, str]]], **kwargs: Any) -> list[float]:
-    """Reward: does the completion parse as valid EcomRLVE action JSON?
+    """Reward: does the completion parse as a valid agent action?
 
-    Checks that the output contains a valid JSON object with the
-    required 'assistant_message' field.
+    Accepts either Qwen-native XML ``<tool_call>`` blocks or the
+    EcomRLVE terminal JSON protocol.
 
-    +1.0  valid JSON with assistant_message
-    -0.5  valid JSON but missing required fields
-    -2.0  invalid JSON / no JSON found
+    +1.0  valid XML tool_call(s) or valid JSON with assistant_message
+    -0.5  partially valid / missing required fields
+    -2.0  unparseable
     """
     scores: list[float] = []
     for completion in completions:
         response = completion[0]["content"]
-        extracted = _extract_json_from_completion(response)
-
-        if extracted is None:
-            scores.append(-2.0)
-            continue
-
-        action, valid = parse_action(extracted)
+        action, valid = parse_action(response)
         if valid and action is not None:
             scores.append(1.0)
-        else:
+        elif _extract_json_from_completion(response) is not None:
             scores.append(-0.5)
+        else:
+            scores.append(-2.0)
 
     return scores
 
@@ -302,20 +431,17 @@ def tool_usage_reward(completions: list[list[dict[str, str]]], **kwargs: Any) ->
     +0.5  has answer with done=true but no tool calls (acceptable for
           simple tasks)
     -0.5  has tool_calls but with invalid tool names
-    -1.0  no JSON / unparseable
+    -1.0  no parseable action
     """
-    VALID_TOOL_PREFIXES = {"catalog.", "cart.", "order.", "return.", "policy."}
+    VALID_TOOL_PREFIXES = {
+        "catalog.", "cart.", "order.", "return.", "policy.",
+        "datetime.", "user.",
+    }
 
     scores: list[float] = []
     for completion in completions:
         response = completion[0]["content"]
-        extracted = _extract_json_from_completion(response)
-
-        if extracted is None:
-            scores.append(-1.0)
-            continue
-
-        action, valid = parse_action(extracted)
+        action, valid = parse_action(response)
         if not valid or action is None:
             scores.append(-1.0)
             continue
@@ -360,14 +486,14 @@ def env_reward(completions: list[list[dict[str, str]]], **kwargs: Any) -> list[f
     scores: list[float] = []
     for i, completion in enumerate(completions):
         response = completion[0]["content"]
-        extracted = _extract_json_from_completion(response)
+        extracted = _completion_for_env(response)
 
         should_print = (_PRINT_COUNTER % 10 == 0)
         _PRINT_COUNTER += 1
 
         if extracted is None:
             if should_print:
-                logger.info("[env_reward] No JSON found in completion")
+                logger.info("[env_reward] No parseable action found in completion")
             scores.append(-1.0)
             continue
 
@@ -382,6 +508,40 @@ def env_reward(completions: list[list[dict[str, str]]], **kwargs: Any) -> list[f
                 episode_seed=int(eseed),
             )
             env_score = result["reward"]
+
+            # Persist the model's verdict for this episode alongside the
+            # prompt we already wrote in ``sample_prompt``. Sharing the
+            # ``episode_seed`` is enough to join the two rows offline.
+            if _OPENENV.dump_path is not None:
+                breakdown = result.get("reward_breakdown", {}) or {}
+                # Keep the model output on disk too so you can see what
+                # the agent actually emitted, not just the scalar reward.
+                # We store the *raw* response (pre-extraction) so we
+                # still have the markdown / thinking wrappers if any,
+                # and we truncate to ~8KB to bound the file size.
+                raw_response = response if isinstance(response, str) else str(response)
+                truncated = raw_response[:8192]
+                if len(raw_response) > 8192:
+                    truncated += f"\n... [truncated, original length={len(raw_response)}]"
+                _OPENENV._dump_records([{
+                    "kind": "result",
+                    "env_id": eid,
+                    "episode_seed": int(eseed),
+                    "completion_index": i,
+                    "completion_raw": truncated,
+                    "completion_extracted": extracted,
+                    "reward_raw": float(env_score),
+                    "reward_scaled": float(env_score) * 5.0,
+                    "is_correct": bool(result["is_correct"]),
+                    "turn": int(result.get("turn", 0)),
+                    "termination_reason": result.get(
+                        "termination_reason", "unknown"
+                    ),
+                    "reward_breakdown": {
+                        k: (float(v) if isinstance(v, (int, float)) else v)
+                        for k, v in breakdown.items()
+                    },
+                }])
 
             if should_print:
                 logger.info(
@@ -409,6 +569,55 @@ def env_reward(completions: list[list[dict[str, str]]], **kwargs: Any) -> list[f
 # ===================================================================
 # Tokenizer / Processor compatibility
 # ===================================================================
+
+
+def wrap_tokenizer_with_tools(tokenizer: Any, tools: list[dict[str, Any]]) -> Any:
+    """Rebind ``tokenizer`` so ``apply_chat_template`` always gets ``tools=``.
+
+    TRL / Unsloth ``GRPOTrainer`` requires ``processing_class`` to be an
+    instance of ``PreTrainedTokenizerBase`` or ``ProcessorMixin``
+    (``isinstance`` check). A plain wrapper class fails that check.
+
+    Strategy (方案一): dynamically subclass the *real* tokenizer class and
+    reassign ``tokenizer.__class__``. The instance identity is preserved,
+    so ``isinstance(tokenizer, PreTrainedTokenizerBase)`` still holds, while
+    ``apply_chat_template`` injects the OpenAI-format tool schemas that
+    Qwen chat templates render into ``<tools>...</tools>``.
+    """
+    # Already wrapped in a previous call — just refresh the tool list.
+    if getattr(tokenizer, "_ecom_rlve_tools_wrapped", False):
+        tokenizer._ecom_rlve_tools = tools
+        return tokenizer
+
+    base_cls = type(tokenizer)
+
+    class ToolsAwareTokenizer(base_cls):  # type: ignore[misc,valid-type]
+        """Subclass of the concrete tokenizer with tools= injection."""
+
+        def apply_chat_template(self, *args: Any, **kwargs: Any) -> Any:
+            tool_list = getattr(self, "_ecom_rlve_tools", None)
+            if tool_list is not None:
+                kwargs.setdefault("tools", tool_list)
+            return super().apply_chat_template(*args, **kwargs)
+
+    tokenizer._ecom_rlve_tools = tools
+    tokenizer._ecom_rlve_tools_wrapped = True
+    tokenizer.__class__ = ToolsAwareTokenizer
+    return tokenizer
+
+
+# Backward-compatible name used by unit tests / callers that expect a class.
+# Prefer ``wrap_tokenizer_with_tools`` for production use.
+class ToolsAwareTokenizer:
+    """Deprecated constructor shim — delegates to ``wrap_tokenizer_with_tools``.
+
+    Kept so existing tests that do ``ToolsAwareTokenizer(tok, tools)`` still
+    work. Prefer calling ``wrap_tokenizer_with_tools`` directly.
+    """
+
+    def __new__(cls, tokenizer: Any, tools: list[dict[str, Any]]) -> Any:
+        return wrap_tokenizer_with_tools(tokenizer, tools)
+
 
 def resolve_text_tokenizer(processing_or_tokenizer: Any) -> Any:
     """Return an object with text tokenizer APIs (encode / chat template).
@@ -596,7 +805,20 @@ def parse_args() -> argparse.Namespace:
     # Output
     parser.add_argument(
         "--output_dir", type=str, default="outputs/ecomrlve_grpo",
-        help="Checkpoint output directory (default: outputs/ecomrlve_grpo)",
+        help=(
+            "Base directory for run artifacts (default: outputs/ecomrlve_grpo). "
+            "Unless --no_timestamp is set, a YYYYMMDD_HHMMSS subdirectory is "
+            "created under this path for each training run."
+        ),
+    )
+    parser.add_argument(
+        "--no_timestamp",
+        action="store_true",
+        default=False,
+        help=(
+            "Use --output_dir directly instead of creating a timestamped "
+            "subdirectory. Useful when resuming into a known path."
+        ),
     )
     parser.add_argument(
         "--save_steps", type=int, default=50,
@@ -611,14 +833,31 @@ def parse_args() -> argparse.Namespace:
         "--log_to_file", action="store_true", default=False,
         help=(
             "Also tee training logs to a file. Default path is "
-            "<output_dir>/train.log (created if missing)."
+            "<run_output_dir>/train.log (created if missing)."
         ),
     )
     parser.add_argument(
         "--log_path", type=str, default=None,
         help=(
             "Explicit log file path. Overrides the default "
-            "<output_dir>/train.log. Implies --log_to_file."
+            "<run_output_dir>/train.log. Implies --log_to_file."
+        ),
+    )
+    parser.add_argument(
+        "--dump_prompts", action="store_true", default=False,
+        help=(
+            "Append every sampled prompt (messages + hidden_goal) and "
+            "matching completion result to a JSONL file. Useful for "
+            "offline verification that the environment is generating "
+            "correct user messages and ground-truth targets."
+        ),
+    )
+    parser.add_argument(
+        "--dump_path", type=str, default=None,
+        help=(
+            "Path to the prompt/result dump JSONL file. Defaults to "
+            "<run_output_dir>/prompts.jsonl when --dump_prompts is set. "
+            "Existing files are truncated at start-up."
         ),
     )
 
@@ -628,12 +867,21 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
 
+    # Materialize a per-run directory first so train.log / prompts.jsonl /
+    # checkpoints / final all land in the same place and never clobber a
+    # previous training run's artifacts.
+    run_output_dir = _resolve_run_output_dir(
+        args.output_dir,
+        with_timestamp=not args.no_timestamp,
+    )
+    args.output_dir = str(run_output_dir)
+
     if args.log_path:
         log_file = Path(args.log_path).expanduser().resolve()
         _setup_log_file(log_file)
         logger.info("Logging to file: %s", log_file)
     elif args.log_to_file:
-        log_file = Path(args.output_dir) / "train.log"
+        log_file = run_output_dir / "train.log"
         _setup_log_file(log_file)
         logger.info("Logging to file: %s", log_file)
 
@@ -659,6 +907,23 @@ def main() -> None:
         "Environment ready: %d envs, catalog loaded",
         len(_OPENENV.env_ids),
     )
+
+    # Configure the optional prompt/result dump. We truncate the file
+    # at start-up so each run starts fresh — useful when iterating on
+    # reward shaping or dataset fixes.
+    if args.dump_prompts:
+        dump_path = Path(
+            args.dump_path if args.dump_path
+            else Path(args.output_dir) / "prompts.jsonl"
+        ).expanduser().resolve()
+        dump_path.parent.mkdir(parents=True, exist_ok=True)
+        # Truncate; subsequent appends are O(1) line writes.
+        dump_path.write_text("", encoding="utf-8")
+        _OPENENV.dump_path = dump_path
+        logger.info(
+            "Prompt/result dump enabled → %s (records per sample + reward result)",
+            dump_path,
+        )
 
     # ------------------------------------------------------------------
     # 2. Load model with Unsloth
@@ -687,6 +952,19 @@ def main() -> None:
     )
     # Qwen3.5 etc. may return a VL Processor; unwrap to a text tokenizer.
     tokenizer = resolve_text_tokenizer(processing)
+
+    # Inject OpenAI-format tool schemas into every apply_chat_template call
+    # so GRPOTrainer (which does not pass tools= itself) still renders the
+    # Qwen <tools>...</tools> block with full parameter constraints.
+    # wrap_tokenizer_with_tools rebinds __class__ to a subclass of the real
+    # tokenizer so isinstance(..., PreTrainedTokenizerBase) still passes.
+    openai_tools = _OPENENV.env._tool_registry.to_openai_tools()
+    tokenizer = wrap_tokenizer_with_tools(tokenizer, openai_tools)
+    logger.info(
+        "Injected %d tools into chat template (OpenAI tools protocol; class=%s)",
+        len(openai_tools),
+        type(tokenizer).__name__,
+    )
 
     logger.info("Model loaded. Adding LoRA adapters (rank=%d)...", args.lora_rank)
 
@@ -787,7 +1065,7 @@ def main() -> None:
     # 5. Create trainer with EcomRLVE reward functions
     # ------------------------------------------------------------------
     logger.info("Creating GRPOTrainer with 3 reward functions...")
-    logger.info("  1. format_reward:     valid JSON action format check")
+    logger.info("  1. format_reward:     valid XML tool_call or terminal JSON")
     logger.info("  2. tool_usage_reward: correct tool names & structure")
     logger.info("  3. env_reward:        EcomRLVE-GYM environment reward (×5)")
 

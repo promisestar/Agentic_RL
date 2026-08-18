@@ -56,9 +56,19 @@ class CatalogSearchArgs(BaseModel):
     filters: dict[str, Any] | None = Field(
         default=None,
         description=(
-            "Optional metadata filters. Keys from FILTER_KEYS: "
-            "cat, brand, color, size, material, connector_type, "
-            "price_min, price_max, rating_min, ship_days_max, etc."
+            "Optional metadata filters. ONLY these keys are valid "
+            "(unknown keys are silently ignored): "
+            "cat, brand, store, color, size, material, connector_type, "
+            "item_form, skin_type, finish_type, "
+            "price_min, price_max, rating_min, rating_max, "
+            "rating_count_min, ship_days_max, "
+            "wattage_min, wattage_max, weight_lbs_max, "
+            "screen_size_inches_min, screen_size_inches_max. "
+            "IMPORTANT: 'cat' must be the FULL category path string "
+            "(e.g. 'electronics/mobile/tablets'), NOT a list and NOT a "
+            "single segment like 'electronics'. "
+            "Use 'price_max' for an upper price bound (NOT 'max_price'). "
+            "Do NOT invent keys such as 'category', 'subcategory', or 'max_price'."
         ),
     )
     top_k: int = Field(default=20, ge=1, le=500, description="Number of results to return")

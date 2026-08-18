@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -255,25 +256,86 @@ class ActionSchema(BaseModel):
 # ---------------------------------------------------------------------------
 
 
-def parse_action(action_json: str) -> tuple[ActionSchema | None, bool]:
-    """Parse the LLM's action JSON into an ActionSchema.
+_TOOL_CALL_BLOCK_RE = re.compile(
+    r"<tool_call>\s*(.*?)\s*</tool_call>",
+    re.DOTALL | re.IGNORECASE,
+)
+_FUNCTION_RE = re.compile(
+    r"<function=([^>\s]+)\s*>\s*(.*?)\s*</function>",
+    re.DOTALL | re.IGNORECASE,
+)
+_PARAMETER_RE = re.compile(
+    r"<parameter=([^>\s]+)\s*>\s*(.*?)\s*</parameter>",
+    re.DOTALL | re.IGNORECASE,
+)
 
-    Spec Section 8.3 step 1:
-        Parse check -- invalid JSON or schema violation triggers
-        done=True, reward=-1.
 
-    The function attempts lenient parsing: it first tries strict
-    pydantic validation, then falls back to basic dict parsing with
-    manual field extraction.
+def _coerce_parameter_value(raw: str) -> Any:
+    """Best-effort parse of a Qwen tool-call parameter body.
+
+    Tries JSON first (objects, arrays, numbers, booleans, null); falls
+    back to the stripped string.
+    """
+    text = raw.strip()
+    if not text:
+        return ""
+    try:
+        return json.loads(text)
+    except (json.JSONDecodeError, TypeError):
+        return text
+
+
+def parse_qwen_tool_calls(text: str) -> list[ToolCall]:
+    """Extract Qwen-native XML ``<tool_call>`` blocks into ``ToolCall``s.
+
+    Expected shape (from Qwen3.5 chat_template.jinja)::
+
+        <tool_call>
+        <function=catalog.search>
+        <parameter=query>
+        tablets
+        </parameter>
+        <parameter=filters>
+        {"price_max": 35.14, "cat": "electronics/mobile/tablets"}
+        </parameter>
+        </function>
+        </tool_call>
 
     Args:
-        action_json: Raw JSON string from the LLM.
+        text: Raw model completion (may contain preamble + tool_call XML).
 
     Returns:
-        Tuple of (parsed_action, format_valid):
-            - parsed_action: ActionSchema if parsing succeeded, None otherwise.
-            - format_valid: True if the action was successfully parsed.
+        List of ToolCall instances (possibly empty if none found).
     """
+    calls: list[ToolCall] = []
+    for block_match in _TOOL_CALL_BLOCK_RE.finditer(text or ""):
+        block = block_match.group(1)
+        for fn_match in _FUNCTION_RE.finditer(block):
+            name = fn_match.group(1).strip()
+            body = fn_match.group(2)
+            args: dict[str, Any] = {}
+            for param_match in _PARAMETER_RE.finditer(body):
+                key = param_match.group(1).strip()
+                args[key] = _coerce_parameter_value(param_match.group(2))
+            if name:
+                calls.append(ToolCall(name=name, args=args))
+        # Some models omit the inner </function> wrapper and put
+        # <function=NAME> ... </tool_call> only. Fall back:
+        if not list(_FUNCTION_RE.finditer(block)):
+            bare = re.search(r"<function=([^>\s]+)\s*>", block, re.IGNORECASE)
+            if bare:
+                name = bare.group(1).strip()
+                args = {
+                    m.group(1).strip(): _coerce_parameter_value(m.group(2))
+                    for m in _PARAMETER_RE.finditer(block)
+                }
+                if name:
+                    calls.append(ToolCall(name=name, args=args))
+    return calls
+
+
+def _parse_action_from_json(action_json: str) -> tuple[ActionSchema | None, bool]:
+    """Original JSON-only parse path (EcomRLVE terminal / legacy format)."""
     # Step 1: Parse raw JSON
     try:
         raw = json.loads(action_json)
@@ -338,3 +400,74 @@ def parse_action(action_json: str) -> tuple[ActionSchema | None, bool]:
     except Exception as exc:
         logger.debug("parse_action: lenient parsing also failed: %s", exc)
         return None, False
+
+
+def parse_action(action_json: str) -> tuple[ActionSchema | None, bool]:
+    """Parse an LLM action into an ActionSchema.
+
+    Supports two formats (checked in order):
+
+    1. **Qwen-native XML tool calls** (``<tool_call>...</tool_call>``),
+       produced when the chat template is rendered with ``tools=``.
+       Preamble text before the first ``<tool_call>`` becomes
+       ``assistant_message``; ``answer`` is left ``None``.
+    2. **EcomRLVE JSON** (legacy / terminal answer)::
+
+           {"assistant_message": "...", "tool_calls": [...], "answer": {...}}
+
+    Spec Section 8.3 step 1:
+        Parse check -- invalid JSON or schema violation triggers
+        done=True, reward=-1.
+
+    Args:
+        action_json: Raw model completion string (XML and/or JSON).
+
+    Returns:
+        Tuple of (parsed_action, format_valid):
+            - parsed_action: ActionSchema if parsing succeeded, None otherwise.
+            - format_valid: True if the action was successfully parsed.
+    """
+    text = (action_json or "").strip()
+    if not text:
+        return None, False
+
+    # Path 1: Qwen XML tool_call blocks
+    if "<tool_call>" in text.lower():
+        tool_calls = parse_qwen_tool_calls(text)
+        if tool_calls:
+            # Everything before the first <tool_call> is the assistant message.
+            first_idx = text.lower().find("<tool_call>")
+            preamble = text[:first_idx].strip()
+            # Strip residual think blocks / markdown fences from preamble.
+            preamble = re.sub(
+                r"<think>.*?</think>", "", preamble, flags=re.DOTALL
+            ).strip()
+            if not preamble:
+                preamble = "Using tools."
+            try:
+                action = ActionSchema(
+                    assistant_message=preamble,
+                    tool_calls=tool_calls,
+                    answer=None,
+                )
+                return action, True
+            except Exception as exc:
+                logger.debug("parse_action: XML ActionSchema failed: %s", exc)
+                return None, False
+        # Fall through to JSON if <tool_call> tags were malformed.
+
+    # Path 2: JSON (possibly wrapped in markdown / thinking tokens)
+    candidate = text
+    if "```" in candidate:
+        first = candidate.find("```") + 3
+        second = candidate.find("```", first)
+        if second > first:
+            block = candidate[first:second].strip()
+            block = block.removeprefix("json\n").removeprefix("json").strip()
+            candidate = block
+    start = candidate.find("{")
+    end = candidate.rfind("}")
+    if start != -1 and end > start:
+        candidate = candidate[start : end + 1]
+
+    return _parse_action_from_json(candidate)
